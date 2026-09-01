@@ -1,0 +1,36 @@
+Ollama Video Course: https://www.youtube.com/watch?v=GWB9ApTPTv4
+Ollama API docs: https://github.com/ollama/ollama/blob/main/docs/api.md | https://docs.ollama.com/api/introduction
+
+REST API Examples:
+
+    Ollama runs in the background and exposes an API endpoint at local port 11434
+
+    curl http://localhost:11434/api/generate -d '{
+        "model" : "llama3.2:3b",
+        "prompt" : "Why is the sky blue?"
+    }'
+
+    curl http://localhost:11434/api/generate -d '{
+        "model" : "llama3.2:3b",
+        "prompt" : "Tell me a fun fact about Portugal",
+        "stream" : false
+    }'
+
+    curl http://localhost:11434/api/chat -d '{
+        "model" : "llama3.2:3b",
+        "messages" : [
+            {
+                "role" : "user",
+                "content" : "Tell me a fun fact about Mozambique"
+            }
+        ],
+        "stream" : false
+    }'
+
+    curl http://localhost:11434/api/generate -d '{
+        "model" : "llama3.2:3b",
+        "prompt" : "Tell me something interesting about the state of Florida. Respond in JSON",
+        "format" : "json",
+        "stream" : false
+    }'
+

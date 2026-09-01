@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Vector store (regenerable from the source PDF)
+chroma_db/
+
+# Secrets
+.env
+*.key
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/

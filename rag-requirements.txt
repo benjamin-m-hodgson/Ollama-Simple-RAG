@@ -1,0 +1,25 @@
+# Core LangChain (1.x)
+langchain
+langchain-core
+langchain-classic          # MultiQueryRetriever and other pre-1.0 components
+
+# Integrations
+langchain-ollama           # ChatOllama + OllamaEmbeddings
+langchain-unstructured     # UnstructuredLoader (replaces langchain-community loader)
+langchain-chroma           # Chroma vectorstore (replaces langchain-community vectorstore)
+
+# Document parsing
+unstructured[all-docs]     # includes the [pdf] extras; needs `brew install poppler tesseract`
+
+# Vector store + model runtime
+chromadb
+ollama
+
+# ----- removed from the original list, and why -----
+# langchain-community      # no longer imported; both its loader and vectorstore are replaced above
+# langchain_text_splitters # unstructured's chunking_strategy="by_title" handles chunking now
+# unstructured             # redundant: unstructured[all-docs] is a superset
+# pdfplumber               # not imported; unstructured brings its own PDF backends
+# fastembed                # not imported; embeddings come from Ollama
+# sentence-transformers    # not imported; large download (~2GB with torch)
+# elevenlabs               # not imported; text-to-speech, unrelated to this pipeline
