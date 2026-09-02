@@ -1,36 +1,62 @@
 """
 Simple local RAG pipeline over a PDF, using Ollama for both embeddings and chat.
 
-Run `pip install -r Llama/rag-requirements.txt` to install the required packages.
+Run `pip install -r rag-requirements.txt` to install the required packages.
+Requires a running Ollama server (`ollama serve`).
 
 Pipeline:
 
     1. Ingest a PDF file
-    2. Extract text from PDF files and partition into small chunks
+    2. Extract text from the PDF file and partition into small chunks
     3. Send the chunks to the embedding model
     4. Save the embeddings to a vector database
     5. Perform similarity search (via multi-query expansion) on the vector database to find similar documents
     6. Retrieve the similar chunks and feed them to the LLM to answer the question
+
+Usage:
+    python rag-pdf.py
+    python rag-pdf.py --question "How do I report BOI?"
+    python rag-pdf.py --rebuild          # discard cached embeddings first
+        
 """
 
+import argparse
 import logging
+import shutil
+import sys
 from pathlib import Path
+from textwrap import dedent
 
 from langchain_chroma import Chroma
 from langchain_classic.retrievers.multi_query import MultiQueryRetriever
+from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
-from langchain_core.runnables import RunnablePassthrough
+from langchain_core.runnables import Runnable, RunnablePassthrough
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_unstructured import UnstructuredLoader
+from langchain_core.output_parsers import BaseOutputParser
 
 import ollama
 
-# pdfminer logs a "Cannot set non-stroke color" warning for every malformed
-# color operator in the PDF. Harmless for text extraction, but it floods stdout.
-logging.getLogger("pdfminer").setLevel(logging.ERROR)
-logging.basicConfig(level = logging.INFO, format = "%(message)s")
+# ===== LOGGING ===== #
+ 
+# Configure our own logger rather than the root logger, so third-party
+# libraries don't inherit INFO level and flood stdout.
+# A logger decides whether a message passes; a handler decides where it goes.
 log = logging.getLogger("simple-rag")
+log.setLevel(logging.INFO)
+log.addHandler(logging.StreamHandler(sys.stdout))
+
+# Python's loggers form a hierarchy, and by default a record travels up it 
+# after your handler runs: simple-rag → root. 
+# Setting propagate = False stops the record at the simple-rag logger.
+log.propagate = False
+ 
+# pdfminer logs "Cannot set non-stroke color" for every malformed color
+# operator in the PDF. Harmless for text extraction, but it floods stdout.
+for noisy in ("pdfminer", "pikepdf", "httpx", "chromadb", "unstructured", "urllib3"):
+    logging.getLogger(noisy).setLevel(logging.ERROR)
 
 
 # ===== CONFIG ===== #
@@ -40,14 +66,16 @@ log = logging.getLogger("simple-rag")
 BASE_DIR = Path(__file__).resolve().parent
 DOC_PATH = BASE_DIR / "data" / "BOI.pdf"
 PERSIST_DIR = BASE_DIR / "chroma_db"
-print(BASE_DIR)
-print(DOC_PATH)
 
 CHAT_MODEL = "llama3.2:3b"
 EMBEDDING_MODEL = "nomic-embed-text"
 COLLECTION_NAME = "simple-rag"
 
-QUESTION = "What are the main points as a business owner I should be aware of?"
+DEFAULT_QUESTION = "What are the main points as a business owner I should be aware of?"
+
+# Strategies the local unstructured library supports. "by_page" and
+# "by_similarity" exist only in Unstructured's hosted Platform/API.
+LOCAL_CHUNKING_STRATEGIES = {"by_title", "basic", None}
 
 
 # ===== Steps 1 & 2: Load + Chunk ===== #
@@ -126,7 +154,8 @@ def load_chunks(path: Path,
     -------
     list[Document]
         LangChain Documents. Each carries metadata including `category`
-        (the element type), `page_number`, and `source`.
+        (after chunking this is "CompositeElement", not the original element
+        type), `page_number`, `source`, and `orig_elements`.
 
     Raises
     ------
@@ -137,6 +166,12 @@ def load_chunks(path: Path,
     """
     if not path.exists():
         raise FileNotFoundError(f"PDF not found: {path}")
+
+    if chunking_strategy not in LOCAL_CHUNKING_STRATEGIES:
+        raise ValueError(
+            f"chunking_strategy={chunking_strategy!r} is not available in the "
+            f"local unstructured library. Choose from {LOCAL_CHUNKING_STRATEGIES}."
+        )
 
     loader_kwargs = {"file_path" : str(path)}
 
@@ -166,95 +201,152 @@ def load_chunks(path: Path,
 
 # ===== Steps 3 & 4: Embed + Store ===== #
 
+def _collection_count(store: Chroma) -> int:
+    """
+    Number of documents in the store.
+ 
+    Chroma exposes no public count on the LangChain wrapper, so this reaches
+    into the underlying collection. Isolated here so there is one place to
+    fix if the private attribute changes.
+    """
+    return store._collection.count()
 
-doc_path = "./Llama/data/BOI.pdf"
-model = "llama3.2:3b"
+def build_vector_db(path: Path, rebuild: bool = False) -> Chroma:
+    """
+    Return a Chroma store for `path`, reusing persisted embeddings when present.
+ 
+    The PDF is only partitioned when the store is empty. Partitioning is
+    typically slower than embedding, so loading it unconditionally would
+    defeat the point of persisting.
+    """
+    if rebuild and PERSIST_DIR.exists():
+        log.info("Removing cached embeddings at %s", PERSIST_DIR)
+        shutil.rmtree(PERSIST_DIR)
 
-# Local PDF file uploads
-if doc_path:
-    # loader = UnstructuredLoader(file_path = doc_path)
-    loader = UnstructuredPDFLoader(file_path = doc_path)
-    data = loader.load()
-    print(f"File loading complete. {len(data)} elements extracted.")
-    if data:
-        # Preview first page
-        content = data[0].page_content
-        print(content[:100])
-        # print(content)
-else:
-    print("Upload a PDF file.")
+    ollama.pull(EMBEDDING_MODEL)
+    embeddings = OllamaEmbeddings(model = EMBEDDING_MODEL)
 
-# ===== Extract text from PDF files and split into small chunks ===== #
+    store = Chroma(
+        collection_name = COLLECTION_NAME,
+        embedding_function = embeddings,
+        persist_directory = str(PERSIST_DIR)
+    )
 
-from langchain_ollama import OllamaEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
+    existing = _collection_count(store)
+    if existing == 0:
+        chunks = load_chunks(path)
+        log.info("Embedding %d chunks (first run)...", len(chunks))
+        store.add_documents(chunks)
+        log.info("Embeddings stored in %s", PERSIST_DIR)
+    else:
+        log.info("Reusing %d existing embeddings", existing)
+ 
+    return store
 
-# Split and chunk
-text_splitter = RecursiveCharacterTextSplitter(chunk_size = 1200, chunk_overlap = 300)
-chunks = text_splitter.split_documents(data)
-print("Document splitting complete.")
+# ===== Steps 5 & 6: Retrieve + Answer ===== #
 
-# print(f"Number of chunks: {len(chunks)}")
-# print(f"Example chunk: {chunks[0]}")
+# LangChain's built-in parser splits on newlines but doesn't filter empty lines.
+class LineListOutputParser(BaseOutputParser[list[str]]):
+    """Split LLM output into non-empty, stripped lines."""
 
-# ===== Add to vector database ===== #
+    def parse(self, text: str) -> list[str]:
+        result = []
+        for line in text.splitlines():
+            # Keep only lines that have content after whitespace removal
+            if line.strip():        
+                result.append(line.strip())
+        return result
 
-import ollama
-embedding_model = "nomic-embed-text"
 
-ollama.pull(embedding_model)
-vector_db = Chroma.from_documents(
-    documents = chunks,
-    embedding = OllamaEmbeddings(model = embedding_model),
-    collection_name = "simple-rag"
-)
-print("Embedded chunks added to vector databse.")
-
-# ===== Retrieval ===== #
-
-from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_ollama import ChatOllama
-from langchain_core.runnables import RunnablePassthrough
-from langchain_classic.retrievers.multi_query import MultiQueryRetriever
-
-llm = ChatOllama(model = model)
-
-# A simple technique to generate multiple questions from a single question and then retrieve documents
-# based on those questions, getting the best of both worlds.
+# dedent() strips the shared leading whitespace so the model receives clean
+# prompt text rather than an indented block.
 QUERY_PROMPT = PromptTemplate(
-    input_variables = ["question"],
-    template = """You are an AI language model assistant. Your task is to generate five
-    different versions of the given user question to retrieve relevant documents from
-    a vector database. By generating multiple perspectives on the user question, your
-    goal is to help the user overcome some of the limitations of the distance-based
-    similarity search. Provide these alternative questions separated by newlines.
-    Original question: {question}""",
+    input_variables=["question"],
+    template=dedent("""\
+        You are an AI language model assistant. Your task is to generate five
+        different versions of the given user question to retrieve relevant
+        documents from a vector database. By generating multiple perspectives
+        on the user question, your goal is to help the user overcome some of
+        the limitations of distance-based similarity search. Provide these
+        alternative questions separated by newlines. Do not include any
+        additional text in the response - only the five different versions.
+        Original question: {question}
+    """),
 )
 
-retriever = MultiQueryRetriever.from_llm(
-    vector_db.as_retriever(), llm, prompt = QUERY_PROMPT
-)
+RAG_TEMPLATE = dedent("""\
+    Answer the question based ONLY on the following context.
+    If the context does not contain the answer, say so rather than guessing.
+ 
+    Context: {context}
+ 
+    Question: {question}
+""")
 
-# RAG prompt
-rag_template = """Answer the question based ONLY on the following context: {context}
-Question: {question}
-"""
+def build_chain(store: Chroma, k: int = 3) -> Runnable:
+    """
+    Assemble the retrieval chain.
+ 
+    MultiQueryRetriever asks the LLM to rephrase the question several ways and
+    unions the results, which helps when the user's wording does not match the
+    document's. It costs one extra LLM call per query.
+ 
+    Parameters
+    ----------
+    k : int, optional 
+    k is the number of chunks fetched per generated query but MultiQueryRetriever 
+    issues multiple queries, so the context passed to the LLM can be several 
+    times k after deduplication. Default 3.
+    """
 
-chat_prompt = ChatPromptTemplate.from_template(rag_template)
+    llm = ChatOllama(model = CHAT_MODEL)
 
-chain = (
-    {"context" : retriever, "question" : RunnablePassthrough()}
-    | chat_prompt
-    | llm
-    | StrOutputParser()
-)
+    # MultiQueryRetriever.from_llm() uses a parser that keeps blank lines, so small 
+    # models that separate their questions with blank lines produce empty queries.
+    query_chain = QUERY_PROMPT | llm | LineListOutputParser()
 
-# res = chain.invoke(input=("what is the document about?",))
-res = chain.invoke(
-    input = ("what are the main points as a business owner I should be aware of?",)
-)
-# res = chain.invoke(input=("how to report BOI?",))
+    retriever = MultiQueryRetriever(
+        retriever = store.as_retriever(search_kwargs = {"k": k}),
+        llm_chain = query_chain,
+    )
 
-print(res)
+    return (
+        {"context": retriever, "question": RunnablePassthrough()}
+        | ChatPromptTemplate.from_template(RAG_TEMPLATE)
+        | llm
+        | StrOutputParser()
+    )
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description = "Query a PDF with a local RAG pipeline.")
+    parser.add_argument("--question", default = DEFAULT_QUESTION, help = "Question to ask.")
+    parser.add_argument("--pdf", type = Path, default = DOC_PATH, help = "PDF to query.")
+    parser.add_argument("--k", type = int, default = 3, help = "Chunks retrieved per query.")
+    parser.add_argument(
+        "--rebuild", action = "store_true", help = "Discard cached embeddings and re-embed."
+    )
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+ 
+    try:
+        ollama.pull(CHAT_MODEL)
+    except Exception as exc:
+        # ollama raises connection errors that don't make the cause obvious.
+        log.error("Could not reach Ollama (%s). Is `ollama serve` running?", exc)
+        sys.exit(1)
+ 
+    store = build_vector_db(args.pdf, rebuild = args.rebuild)
+    chain = build_chain(store, k = args.k)
+ 
+    log.info("\nQuestion: %s\n", args.question)
+
+    # Pass the question as a plain string. RunnablePassthrough forwards
+    # whatever it receives, so wrapping it in a tuple would send a tuple
+    # through to the prompt.
+    print(chain.invoke(args.question))
+
+
+if __name__ == "__main__":
+    main()
