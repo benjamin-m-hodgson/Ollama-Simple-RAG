@@ -1,3 +1,4 @@
+# main.py
 """
 Simple local RAG pipeline over a PDF, using Ollama for both embeddings and chat.
 
