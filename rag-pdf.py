@@ -179,7 +179,8 @@ def load_chunks(path: Path,
         loader_kwargs.update(
             chunking_strategy = chunking_strategy,
             max_characters = max_characters,
-            overlap = overlap
+            overlap = overlap,
+            overlap_all = overlap_all
         )
         if new_after_n_chars is not None:
             loader_kwargs.update(new_after_n_chars = new_after_n_chars)
