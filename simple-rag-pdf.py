@@ -45,9 +45,9 @@ Usage:
     python simple-rag-pdf.py --chunking-strategy basic --max-characters 1500 --rebuild
  
 IMPORTANT: embeddings are cached in chroma_db/ and the only staleness check
-is whether the collection is empty. Changing any chunking argument -- or
-passing a different --pdf -- will silently reuse the previous embeddings.
-Pass --rebuild whenever you change a chunking argument or the document.
+is whether the collection is empty. Changing the document, embedding model,
+or any chunking argument will silently reuse the previous embeddings.
+Pass --rebuild whenever any is changed.
 """
 
 import argparse
@@ -70,27 +70,73 @@ import ollama
 
 # ===== LOGGING ===== #
  
-# Configure our own logger rather than the root logger, so third-party
-# libraries don't inherit INFO level and flood stdout.
-# A logger decides whether a message passes; a handler decides where it goes.
-log = logging.getLogger("simple-rag")
-log.setLevel(logging.INFO)
-log.addHandler(logging.StreamHandler(sys.stdout))
-
-# Python's loggers form a hierarchy, and by default a record travels up it 
-# after your handler runs: simple-rag → root. 
-# Setting propagate = False stops the record at the simple-rag logger.
-log.propagate = False
-logging.getLogger().setLevel(logging.WARNING)
- 
-# pdfminer logs "Cannot set non-stroke color" for every malformed color
-# operator in the PDF. Harmless for text extraction, but it floods stdout.
-for noisy in ("pdfminer", "pikepdf", "httpx", "chromadb", "unstructured", "urllib3",
-              "langchain_classic.retrievers.multi_query"):
-    logging.getLogger(noisy).setLevel(logging.ERROR)
+# Logger for this script's own messages. Configured by configure_logging(),
+# which main() calls before any other work.
+log = logging.getLogger("simple-rag-pdf")
 
 # Logs the queries MultiQueryRetriever generates. Enabled by --verbose.
 MULTI_QUERY_LOGGER = "langchain_classic.retrievers.multi_query"
+
+# Third-party loggers that inherit root's level and flood stdout. pdfminer in
+# particular logs "Cannot set non-stroke color" for every malformed color
+# operator in the PDF -- harmless for text extraction, but noisy.
+NOISY_LOGGERS = (
+    "pdfminer",
+    "pikepdf",
+    "httpx",
+    "chromadb",
+    "unstructured",
+    "urllib3",
+    MULTI_QUERY_LOGGER
+)
+
+def configure_logging(verbose: bool = False) -> None:
+    """
+    Set up logging for the script.
+
+    Called from main() rather than at import time. That ordering matters: a
+    dependency in the unstructured tree calls logging.basicConfig() when it is
+    imported, which installs a root handler and sets root to INFO. Configuring
+    from main() means those imports have already run, so nothing set here is
+    immediately overwritten.
+
+    Safe to call more than once -- handlers are only added if absent.
+
+    Parameters
+    ----------
+    verbose : bool, optional
+        Log the queries MultiQueryRetriever generates. Default False.
+        CLI: --verbose
+    """
+    # A logger decides whether a message passes; a handler decides where it
+    # goes. The guard keeps a second call from attaching a duplicate handler.
+    log.setLevel(logging.INFO)
+    if not log.handlers:
+        log.addHandler(logging.StreamHandler(sys.stdout))
+
+    # Python's loggers form a hierarchy, and a record travels up it after our
+    # handler runs: simple-rag-pdf -> root. propagate = False stops it here, so a
+    # root handler installed by a dependency cannot print it a second time.
+    log.propagate = False
+
+    # Backstop only. basicConfig() may run later and reset root's level, so
+    # this is not sufficient on its own -- the explicit per-logger levels
+    # below are what actually holds, because a level set directly on a logger
+    # takes precedence over inheritance from its ancestors.
+    logging.getLogger().setLevel(logging.WARNING)
+
+    for name in NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.ERROR)
+
+    if verbose:
+        # Re-enable the one logger silenced above, with its own handler and
+        # propagate = False for the same reason as `log`.
+        multi_query = logging.getLogger(MULTI_QUERY_LOGGER)
+        multi_query.setLevel(logging.INFO)
+        if not multi_query.handlers:
+            multi_query.addHandler(logging.StreamHandler(sys.stdout))
+        multi_query.propagate = False
+
 
 # ===== CONFIG ===== #
 
@@ -253,6 +299,37 @@ def load_chunks(path: Path,
 
 # ===== Steps 3 & 4: Embed + Store ===== #
 
+# Chroma metadata values must be scalars, None, or lists of scalars.
+# unstructured attaches nested dicts -- `coordinates` holds a points tuple
+# plus layout dimensions -- which fail validation. by_title chunking happens
+# to discard these when it merges elements into CompositeElements, so this
+# only bites under "basic" and "none".
+SCALAR_TYPES = (str, int, float, bool)
+
+def _clean_metadata(docs: list[Document]) -> list[Document]:
+    """
+    Return copies of `docs` with metadata Chroma cannot store removed.
+
+    Keeps scalars, None, and lists of scalars. Drops anything else -- dicts,
+    tuples, and objects.
+
+    Copies rather than mutates, so load_chunks' callers keep the full
+    metadata and only what reaches Chroma is stripped.
+    """
+    cleaned = []
+    for doc in docs:
+        metadata = {}
+        for key, value in doc.metadata.items():
+            if value is None or isinstance(value, SCALAR_TYPES):
+                metadata[key] = value
+            elif isinstance(value, list) and all(
+                isinstance(item, SCALAR_TYPES) for item in value
+            ):
+                metadata[key] = value
+            # anything else (dicts, tuples, objects) is dropped
+        cleaned.append(Document(page_content = doc.page_content, metadata = metadata))
+    return cleaned
+
 def _collection_count(store: Chroma) -> int:
     """
     Number of documents in the store.
@@ -291,7 +368,7 @@ def build_vector_db(path: Path,
         log.info("Removing cached embeddings at %s", PERSIST_DIR)
         shutil.rmtree(PERSIST_DIR)
 
-    ollama.pull(embedding_model) # TODO: update this to only pull the model if it doesn't already exist in Ollama?
+    ollama.pull(embedding_model)
     embeddings = OllamaEmbeddings(model = embedding_model)
 
     store = Chroma(
@@ -302,13 +379,13 @@ def build_vector_db(path: Path,
 
     existing = _collection_count(store)
     if existing == 0:
-        chunks = load_chunks(path)
+        chunks = load_chunks(path, **chunk_params)
         log.info("Embedding %d chunks (first run)...", len(chunks))
-        store.add_documents(chunks, **chunk_params)
+        store.add_documents(_clean_metadata(chunks))
         log.info("Embeddings stored in %s", PERSIST_DIR)
     else:
         log.info("Reusing %d existing embeddings", existing)
-        log.info("Pass --rebuild if the document or chunking arguments changed.")
+        log.info("Pass --rebuild if the document, embedding model, or chunking arguments changed.")
  
     return store
 
@@ -327,6 +404,20 @@ class LineListOutputParser(BaseOutputParser[list[str]]):
                 result.append(line.strip())
         return result
 
+def format_docs(docs: list[Document]) -> str:
+    """
+    Join retrieved documents into the plain text passed to the LLM.
+
+    Without this, the Document objects are stringified into the prompt --
+    ids, metadata, and the orig_elements base64 blob included -- which
+    floods the context.
+    """
+    contents = []
+    for doc in docs:
+        page = doc.metadata.get("page_number")
+        header = f"[Page {page}]" if page else ""
+        contents.append(f"{header}\n{doc.page_content}".strip())
+    return "\n\n".join(contents)
 
 # dedent() strips the shared leading whitespace so the model receives clean
 # prompt text rather than an indented block.
@@ -382,6 +473,7 @@ def build_chain(store: Chroma,
 
     # MultiQueryRetriever.from_llm() uses a parser that keeps blank lines, so small 
     # models that separate their questions with blank lines produce empty queries.
+    # Custom class LineListOutputParser() was implemented above to address this.
     query_chain = QUERY_PROMPT | llm | LineListOutputParser()
 
     retriever = MultiQueryRetriever(
@@ -390,7 +482,7 @@ def build_chain(store: Chroma,
     )
 
     return (
-        {"context": retriever, "question": RunnablePassthrough()}
+        {"context": retriever | format_docs, "question": RunnablePassthrough()}
         | ChatPromptTemplate.from_template(RAG_TEMPLATE)
         | llm
         | StrOutputParser()
@@ -421,10 +513,6 @@ def parse_args() -> argparse.Namespace:
                              help = "Chat model used to answer the question.")
     query_group.add_argument("--question", type = str, default = DEFAULT_QUESTION,
                              help = "Question to ask.")
-    query_group.add_argument("--pdf", type = Path, default = DOC_PATH,
-                             help = "PDF to query.")
-    query_group.add_argument("--embedding-model", type = str, default = DEFAULT_EMBEDDING_MODEL,
-                                 help = "Embedding model used to generate embeddings.")
     query_group.add_argument("--k", type = int, default = DEFAULT_K,
                              help = "Chunks retrieved per generated query.")
  
@@ -433,6 +521,10 @@ def parse_args() -> argparse.Namespace:
         "chunking",
         "Pass --rebuild if any of these change, or the stale embeddings are reused."
     )
+    chunk_group.add_argument("--pdf", type = Path, default = DOC_PATH,
+                             help = "PDF to query.")
+    chunk_group.add_argument("--embedding-model", type = str, default = DEFAULT_EMBEDDING_MODEL,
+                                 help = "Embedding model used to generate embeddings.")
     # "none" maps to Python None in chunk_params_from_args(); argparse
     # choices cannot express None directly.
     chunk_group.add_argument("--chunking-strategy",
@@ -491,11 +583,7 @@ def chunk_params_from_args(args: argparse.Namespace) -> dict:
 def main() -> None:
     args = parse_args()
 
-    if args.verbose:
-        logging.getLogger(MULTI_QUERY_LOGGER).setLevel(logging.INFO)
-        logging.getLogger(MULTI_QUERY_LOGGER).addHandler(
-            logging.StreamHandler(sys.stdout)
-        )
+    configure_logging(verbose = args.verbose)
  
     try:
         ollama.pull(args.chat_model)
@@ -522,6 +610,8 @@ def main() -> None:
     # whatever it receives, so wrapping it in a tuple would send a tuple
     # through to the prompt.
     res = chain.invoke(args.question)
+    if args.verbose:
+        print("\n----------\n")
     print(res)
 
 
