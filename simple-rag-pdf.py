@@ -14,10 +14,40 @@ Pipeline:
     6. Retrieve the similar chunks and feed them to the LLM to answer the question
 
 Usage:
-    python rag-pdf.py
-    python rag-pdf.py --question "How do I report BOI?"
-    python rag-pdf.py --rebuild          # discard cached embeddings first
-        
+
+    # defaults
+    python simple-rag-pdf.py
+ 
+    # ask a different question of the default document
+    python simple-rag-pdf.py --question "How do I report BOI?"
+ 
+    # every argument, with sample values
+    python simple-rag-pdf.py \
+        --chat-model "llama3.2:3b" \
+        --question "What are the filing deadlines?" \
+        --pdf data/BOI.pdf \
+        --embedding-model "nomic-embed-text" \
+        --k 3 \
+        --chunking-strategy by_title \
+        --max-characters 1000 \
+        --new-after-n-chars 800 \
+        --combine-text-under-n-chars 300 \
+        --no-multipage-sections \
+        --overlap 200 \
+        --overlap-all \
+        --rebuild \
+        --verbose
+ 
+    # raw elements, no chunking (one document per Title/NarrativeText/ListItem/Table)
+    python simple-rag-pdf.py --chunking-strategy none --rebuild
+ 
+    # structure-blind packing, for documents without reliable headings
+    python simple-rag-pdf.py --chunking-strategy basic --max-characters 1500 --rebuild
+ 
+IMPORTANT: embeddings are cached in chroma_db/ and the only staleness check
+is whether the collection is empty. Changing any chunking argument -- or
+passing a different --pdf -- will silently reuse the previous embeddings.
+Pass --rebuild whenever you change a chunking argument or the document.
 """
 
 import argparse
@@ -30,12 +60,11 @@ from textwrap import dedent
 from langchain_chroma import Chroma
 from langchain_classic.retrievers.multi_query import MultiQueryRetriever
 from langchain_core.documents import Document
-from langchain_core.output_parsers import StrOutputParser
+from langchain_core.output_parsers import BaseOutputParser, StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from langchain_core.runnables import Runnable, RunnablePassthrough
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_unstructured import UnstructuredLoader
-from langchain_core.output_parsers import BaseOutputParser
 
 import ollama
 
@@ -52,12 +81,16 @@ log.addHandler(logging.StreamHandler(sys.stdout))
 # after your handler runs: simple-rag → root. 
 # Setting propagate = False stops the record at the simple-rag logger.
 log.propagate = False
+logging.getLogger().setLevel(logging.WARNING)
  
 # pdfminer logs "Cannot set non-stroke color" for every malformed color
 # operator in the PDF. Harmless for text extraction, but it floods stdout.
-for noisy in ("pdfminer", "pikepdf", "httpx", "chromadb", "unstructured", "urllib3"):
+for noisy in ("pdfminer", "pikepdf", "httpx", "chromadb", "unstructured", "urllib3",
+              "langchain_classic.retrievers.multi_query"):
     logging.getLogger(noisy).setLevel(logging.ERROR)
 
+# Logs the queries MultiQueryRetriever generates. Enabled by --verbose.
+MULTI_QUERY_LOGGER = "langchain_classic.retrievers.multi_query"
 
 # ===== CONFIG ===== #
 
@@ -67,11 +100,21 @@ BASE_DIR = Path(__file__).resolve().parent
 DOC_PATH = BASE_DIR / "data" / "BOI.pdf"
 PERSIST_DIR = BASE_DIR / "chroma_db"
 
-CHAT_MODEL = "llama3.2:3b"
-EMBEDDING_MODEL = "nomic-embed-text"
 COLLECTION_NAME = "simple-rag"
 
+# Defaults live here so the function signatures and the argparse defaults
+# cannot drift apart.
+DEFAULT_CHAT_MODEL = "llama3.2:3b"
+DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
 DEFAULT_QUESTION = "What are the main points as a business owner I should be aware of?"
+DEFAULT_K = 3
+DEFAULT_CHUNKING_STRATEGY = "by_title"
+DEFAULT_MAX_CHARACTERS = 1000
+DEFAULT_NEW_AFTER_N_CHARS = None
+DEFAULT_COMBINE_TEXT_UNDER_N_CHARS = 300
+DEFAULT_MULTIPAGE_SECTIONS = True
+DEFAULT_OVERLAP = 200
+DEFAULT_OVERLAP_ALL = False
 
 # Strategies the local unstructured library supports. "by_page" and
 # "by_similarity" exist only in Unstructured's hosted Platform/API.
@@ -81,13 +124,13 @@ LOCAL_CHUNKING_STRATEGIES = {"by_title", "basic", None}
 # ===== Steps 1 & 2: Load + Chunk ===== #
 
 def load_chunks(path: Path, 
-                chunking_strategy: str | None = "by_title", 
-                max_characters: int = 1000,
-                new_after_n_chars: int | None = None,
-                combine_text_under_n_chars: int = 300,
-                multipage_sections: bool = True,
-                overlap: int = 200,
-                overlap_all: bool = False
+                chunking_strategy: str | None = DEFAULT_CHUNKING_STRATEGY, 
+                max_characters: int = DEFAULT_MAX_CHARACTERS,
+                new_after_n_chars: int | None = DEFAULT_NEW_AFTER_N_CHARS,
+                combine_text_under_n_chars: int = DEFAULT_COMBINE_TEXT_UNDER_N_CHARS,
+                multipage_sections: bool = DEFAULT_MULTIPAGE_SECTIONS,
+                overlap: int = DEFAULT_OVERLAP,
+                overlap_all: bool = DEFAULT_OVERLAP_ALL
 ) -> list[Document]:
     """
     Partition a PDF into chunks suitable for embedding.
@@ -102,6 +145,7 @@ def load_chunks(path: Path,
         Path to the PDF to load.
     chunking_strategy : {"by_title", "basic", None}, optional
         How elements are recombined. Default "by_title".
+        CLI: --chunking-strategy
 
         - ``None``| no chunking. Returns raw elements, one per Title,
           NarrativeText, ListItem, or Table. Typically many very short
@@ -122,11 +166,13 @@ def load_chunks(path: Path,
         Hard ceiling on chunk size. An individual element longer than this is
         text-split on a word boundary; otherwise elements are never split.
         Default 1000. Match this to your embedding model's context window.
+        CLI: --max-characters
     new_after_n_chars : int | None, optional
         Soft target. Once a chunk reaches this length, close it at the 
         next element boundary if possible, but unlike `max_characters` this 
         is not enforced. When None, unstructured defaults it to `max_characters`. 
         Default None.
+        CLI: --new-after-n-chars
     combine_text_under_n_chars : int, optional
         Merge consecutive sections until the combined length reaches this
         many characters. Guards against the flood of tiny chunks produced
@@ -134,21 +180,25 @@ def load_chunks(path: Path,
         Note this works against section isolation -- too high and it reunites
         sections that "by_title" just separated. Default 300.
         Only operative for chunking_strategy="by_title".
+        CLI: --combine-text-under-n-chars
     multipage_sections : bool, optional
         When True, a section may span a page break. When False, a page break
         also closes the chunk -- the local approximation of by-page chunking.
         Default True.
         Only operative for chunking_strategy="by_title".
+        CLI: --no-multipage-sections
     overlap : int, optional
         Characters of trailing context prepended to the next chunk. Applies
         ONLY to chunks created by text-splitting an oversized element, unless
         overlap_all is True. On a document whose elements all fit within
         max_characters, this has no effect. Default 200.
+        CLI: --overlap
     overlap_all : bool, optional
         Apply `overlap` between all chunks, including those formed from whole
         elements. This deliberately blurs otherwise clean semantic
         boundaries, so treat it as a tunable to validate against retrieval
         quality rather than a default. Default False.
+        CLI: --overlap-all
 
     Returns
     -------
@@ -162,14 +212,15 @@ def load_chunks(path: Path,
     FileNotFoundError
         If `path` does not exist.
     ValueError
-        If no content could be extracted from the PDF.
+        If `chunking_strategy` is not available locally, or if no content
+        could be extracted from the PDF.
     """
     if not path.exists():
         raise FileNotFoundError(f"PDF not found: {path}")
 
     if chunking_strategy not in LOCAL_CHUNKING_STRATEGIES:
         raise ValueError(
-            f"chunking_strategy={chunking_strategy!r} is not available in the "
+            f"chunking_strategy = {chunking_strategy!r} is not available in the "
             f"local unstructured library. Choose from {LOCAL_CHUNKING_STRATEGIES}."
         )
 
@@ -212,20 +263,36 @@ def _collection_count(store: Chroma) -> int:
     """
     return store._collection.count()
 
-def build_vector_db(path: Path, rebuild: bool = False) -> Chroma:
+def build_vector_db(path: Path, 
+                    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+                    rebuild: bool = False, 
+                    **chunk_params
+) -> Chroma:
     """
     Return a Chroma store for `path`, reusing persisted embeddings when present.
  
     The PDF is only partitioned when the store is empty. Partitioning is
     typically slower than embedding, so loading it unconditionally would
     defeat the point of persisting.
+
+    Parameters
+    ----------
+    path : Path
+        PDF to embed.
+    embedding_model : str, optional
+        Embedding model used to generate embeddings. Default "nomic-embed-text".
+    rebuild : bool, optional
+        Delete PERSIST_DIR before building, forcing a re-partition and
+        re-embed. Default False.
+    **chunk_params
+        Forwarded to load_chunks. See its docstring for each parameter.
     """
     if rebuild and PERSIST_DIR.exists():
         log.info("Removing cached embeddings at %s", PERSIST_DIR)
         shutil.rmtree(PERSIST_DIR)
 
-    ollama.pull(EMBEDDING_MODEL)
-    embeddings = OllamaEmbeddings(model = EMBEDDING_MODEL)
+    ollama.pull(embedding_model) # TODO: update this to only pull the model if it doesn't already exist in Ollama?
+    embeddings = OllamaEmbeddings(model = embedding_model)
 
     store = Chroma(
         collection_name = COLLECTION_NAME,
@@ -237,12 +304,14 @@ def build_vector_db(path: Path, rebuild: bool = False) -> Chroma:
     if existing == 0:
         chunks = load_chunks(path)
         log.info("Embedding %d chunks (first run)...", len(chunks))
-        store.add_documents(chunks)
+        store.add_documents(chunks, **chunk_params)
         log.info("Embeddings stored in %s", PERSIST_DIR)
     else:
         log.info("Reusing %d existing embeddings", existing)
+        log.info("Pass --rebuild if the document or chunking arguments changed.")
  
     return store
+
 
 # ===== Steps 5 & 6: Retrieve + Answer ===== #
 
@@ -284,7 +353,10 @@ RAG_TEMPLATE = dedent("""\
     Question: {question}
 """)
 
-def build_chain(store: Chroma, k: int = 3) -> Runnable:
+def build_chain(store: Chroma, 
+                k: int = DEFAULT_K,
+                chat_model: str = DEFAULT_CHAT_MODEL
+) -> Runnable:
     """
     Assemble the retrieval chain.
  
@@ -294,13 +366,19 @@ def build_chain(store: Chroma, k: int = 3) -> Runnable:
  
     Parameters
     ----------
+    store : Chroma
+        Vector store to retrieve from.
     k : int, optional 
-    k is the number of chunks fetched per generated query but MultiQueryRetriever 
-    issues multiple queries, so the context passed to the LLM can be several 
-    times k after deduplication. Default 3.
+        k is the number of chunks fetched per generated query but MultiQueryRetriever 
+        issues multiple queries, so the context passed to the LLM can be several 
+        times k after deduplication. Default 3.
+        CLI: --k
+    chat_model : str, optional
+        Model passed to ChatOllama to generate rephrased question context and answer.
+        Default "llama3.2:3b"
     """
 
-    llm = ChatOllama(model = CHAT_MODEL)
+    llm = ChatOllama(model = chat_model)
 
     # MultiQueryRetriever.from_llm() uses a parser that keeps blank lines, so small 
     # models that separate their questions with blank lines produce empty queries.
@@ -318,35 +396,133 @@ def build_chain(store: Chroma, k: int = 3) -> Runnable:
         | StrOutputParser()
     )
 
+
+# ===== CLI ===== #
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description = "Query a PDF with a local RAG pipeline.")
-    parser.add_argument("--question", default = DEFAULT_QUESTION, help = "Question to ask.")
-    parser.add_argument("--pdf", type = Path, default = DOC_PATH, help = "PDF to query.")
-    parser.add_argument("--k", type = int, default = 3, help = "Chunks retrieved per query.")
-    parser.add_argument(
-        "--rebuild", action = "store_true", help = "Discard cached embeddings and re-embed."
+    """
+    Command-line interface.
+ 
+    Chunking flags mirror load_chunks' parameters one-for-one; see that
+    docstring for what each does. Defaults come from the module constants so
+    the CLI and the function signatures cannot disagree.
+    """
+    parser = argparse.ArgumentParser(
+        description = "Query a PDF with a local RAG pipeline.",
+        formatter_class = argparse.ArgumentDefaultsHelpFormatter
     )
+ 
+    # --- query ---
+    query_group = parser.add_argument_group(
+        "query",
+        "Pass --rebuild if the embedding model is changed."
+    )
+    query_group.add_argument("--chat-model", type = str, default = DEFAULT_CHAT_MODEL,
+                             help = "Chat model used to answer the question.")
+    query_group.add_argument("--question", type = str, default = DEFAULT_QUESTION,
+                             help = "Question to ask.")
+    query_group.add_argument("--pdf", type = Path, default = DOC_PATH,
+                             help = "PDF to query.")
+    query_group.add_argument("--embedding-model", type = str, default = DEFAULT_EMBEDDING_MODEL,
+                                 help = "Embedding model used to generate embeddings.")
+    query_group.add_argument("--k", type = int, default = DEFAULT_K,
+                             help = "Chunks retrieved per generated query.")
+ 
+    # --- chunking (see load_chunks docstring) ---
+    chunk_group = parser.add_argument_group(
+        "chunking",
+        "Pass --rebuild if any of these change, or the stale embeddings are reused."
+    )
+    # "none" maps to Python None in chunk_params_from_args(); argparse
+    # choices cannot express None directly.
+    chunk_group.add_argument("--chunking-strategy",
+                             choices = ["by_title", "basic", "none"],
+                             default = DEFAULT_CHUNKING_STRATEGY,
+                             help = "How elements are recombined into chunks.")
+    chunk_group.add_argument("--max-characters", type = int,
+                             default = DEFAULT_MAX_CHARACTERS,
+                             help = "Hard ceiling on chunk size.")
+    chunk_group.add_argument("--new-after-n-chars", type = int,
+                             default = DEFAULT_NEW_AFTER_N_CHARS,
+                             help = "Soft chunk-size target.")
+    chunk_group.add_argument("--combine-text-under-n-chars", type = int,
+                             default = DEFAULT_COMBINE_TEXT_UNDER_N_CHARS,
+                             help = "Merge sections below this size (by_title only).")
+    chunk_group.add_argument("--no-multipage-sections", action = "store_false",
+                             dest = "multipage_sections",
+                             default = DEFAULT_MULTIPAGE_SECTIONS,
+                             help = "Prevent a section from spanning a page break (by_title only).")
+    chunk_group.add_argument("--overlap", type = int, default = DEFAULT_OVERLAP,
+                             help = "Characters of context carried into the next chunk.")
+    chunk_group.add_argument("--overlap-all", action = "store_true",
+                             default = DEFAULT_OVERLAP_ALL,
+                             help = "Apply --overlap between all chunks, not just split ones.")
+ 
+    # --- run behaviour ---
+    run_group = parser.add_argument_group("run")
+    run_group.add_argument("--rebuild", action = "store_true",
+                           help = "Discard cached embeddings and re-embed.")
+    run_group.add_argument("--verbose", action = "store_true",
+                           help = "Log the queries MultiQueryRetriever generates.")
+ 
     return parser.parse_args()
 
-def main():
+def chunk_params_from_args(args: argparse.Namespace) -> dict:
+    """
+    Collect the load_chunks keyword arguments off the argparse namespace.
+ 
+    argparse turns --max-characters into args.max_characters.
+    """
+    strategy = args.chunking_strategy
+    if strategy == "none":
+        # argparse choices cannot express None, so "none" is the sentinel.
+        strategy = None
+
+    return {
+        "chunking_strategy": strategy,
+        "max_characters": args.max_characters,
+        "new_after_n_chars": args.new_after_n_chars,
+        "combine_text_under_n_chars": args.combine_text_under_n_chars,
+        "multipage_sections": args.multipage_sections,
+        "overlap": args.overlap,
+        "overlap_all": args.overlap_all,
+    }
+
+def main() -> None:
     args = parse_args()
+
+    if args.verbose:
+        logging.getLogger(MULTI_QUERY_LOGGER).setLevel(logging.INFO)
+        logging.getLogger(MULTI_QUERY_LOGGER).addHandler(
+            logging.StreamHandler(sys.stdout)
+        )
  
     try:
-        ollama.pull(CHAT_MODEL)
+        ollama.pull(args.chat_model)
     except Exception as exc:
         # ollama raises connection errors that don't make the cause obvious.
         log.error("Could not reach Ollama (%s). Is `ollama serve` running?", exc)
         sys.exit(1)
  
-    store = build_vector_db(args.pdf, rebuild = args.rebuild)
-    chain = build_chain(store, k = args.k)
+    store = build_vector_db(
+        path = args.pdf,
+        embedding_model = args.embedding_model, 
+        rebuild = args.rebuild,
+        **chunk_params_from_args(args)
+    )
+    chain = build_chain(
+        store, 
+        k = args.k,
+        chat_model = args.chat_model
+    )
  
     log.info("\nQuestion: %s\n", args.question)
 
     # Pass the question as a plain string. RunnablePassthrough forwards
     # whatever it receives, so wrapping it in a tuple would send a tuple
     # through to the prompt.
-    print(chain.invoke(args.question))
+    res = chain.invoke(args.question)
+    print(res)
 
 
 if __name__ == "__main__":
